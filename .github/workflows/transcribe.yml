@@ -1,14 +1,16 @@
 name: Pull transcripts (daily)
 
-# Give the workflow permission to push compiled files back to the repo
 permissions:
   contents: write
 
 on:
   schedule:
-    # 10:30 UTC is 6:30 AM Eastern during daylight time
-    - cron: "30 10 * * *"
+    - cron: "30 10 * * *"   # 6:30 AM ET
   workflow_dispatch:
+  push:
+    paths:
+      - 'channels_*.txt'
+      - '.github/workflows/transcribe.yml'
 
 jobs:
   build-transcripts:
@@ -27,53 +29,71 @@ jobs:
           sudo apt-get install -y ffmpeg
           python3 -m pip install --upgrade yt-dlp
 
-      - name: Prepare folders
+      - name: Prep folders
         run: |
           mkdir -p transcripts/${{ matrix.category }}
 
-      - name: Fetch latest video IDs (past 24h)
+      - name: Show channel list
+        run: |
+          echo "=== channels_${{ matrix.category }}.txt ==="
+          cat channels_${{ matrix.category }}.txt || echo "MISSING channels_${{ matrix.category }}.txt"
+
+      - name: Fetch latest video IDs (past 48h for first run)
+        env:
+          WINDOW: "now-2days"         # change to "now-1day" after you confirm it works
         run: |
           : > ids_${{ matrix.category }}.txt
           while read -r ch; do
             [ -z "$ch" ] && continue
-            # List uploads from last 24h and append IDs
-            yt-dlp --flat-playlist --dateafter now-1day --get-id "$ch" >> ids_${{ matrix.category }}.txt || true
+            # Get IDs from the last WINDOW
+            yt-dlp --flat-playlist --dateafter "$WINDOW" --get-id "$ch" >> ids_${{ matrix.category }}.txt || true
           done < channels_${{ matrix.category }}.txt
           sort -u ids_${{ matrix.category }}.txt -o ids_${{ matrix.category }}.txt
+          echo "Found $(wc -l < ids_${{ matrix.category }}.txt) IDs for ${{ matrix.category }}"
 
       - name: Download captions for each video
         run: |
+          COUNT=0
           while read -r id; do
             [ -z "$id" ] && continue
+            echo "Processing $id"
             yt-dlp "https://www.youtube.com/watch?v=${id}" \
               --skip-download \
               --write-auto-sub --write-subs --sub-langs "en.*" \
               --sub-format "vtt" \
               -o "transcripts/${{ matrix.category }}/%(upload_date)s_%(channel)s_%(id)s.%(ext)s" || true
+            COUNT=$((COUNT+1))
           done < ids_${{ matrix.category }}.txt
+          echo "Tried to download captions for $COUNT videos in ${{ matrix.category }}"
 
       - name: Convert VTT to plain text and stitch
         run: |
-          OUTFILE="transcripts/${{ matrix.category | toJSON }}"
-          OUTFILE=${OUTFILE//\"/}   # clean quotes from toJSON
-          OUTFILE="${OUTFILE^^}"    # uppercase folder name in bash
-          OUTMD="transcripts/${OUTFILE}_COMPILED.md"
+          CATEGORY_UPPER=$(echo "${{ matrix.category }}" | tr '[:lower:]' '[:upper:]')
+          OUTMD="transcripts/${CATEGORY_UPPER}_COMPILED.md"
 
-          echo "# ${OUTFILE} transcripts (past 24h)" > "$OUTMD"
+          echo "# ${CATEGORY_UPPER} transcripts (past 48h)" > "$OUTMD"
           echo "" >> "$OUTMD"
 
           shopt -s nullglob
+          FILECOUNT=0
           for f in transcripts/${{ matrix.category }}/*.vtt; do
+            FILECOUNT=$((FILECOUNT+1))
             echo "## $(basename "$f")" >> "$OUTMD"
-            # remove headers and timestamps, collapse blank lines
+            # strip headers, numbers, and timestamps
             sed -E '/WEBVTT|Kind:|Language:/d; s/^[0-9]{1,3}$//; s/^([0-9:.,-> ]+)$//; /^\s*$/d' "$f" >> "$OUTMD"
             echo "" >> "$OUTMD"
           done
+
+          if [ "$FILECOUNT" -eq 0 ]; then
+            echo "_No caption files found in the window (videos may not have captions or no uploads in time window)._ " >> "$OUTMD"
+          fi
+
+          echo "Compiled $FILECOUNT caption file(s) into $OUTMD"
 
       - name: Commit results
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git add transcripts/* || true
-          git commit -m "Daily transcripts $(date -u +"%Y-%m-%d") for ${{ matrix.category }}" || echo "Nothing to commit"
-          git push
+          git add -A transcripts
+          git commit -m "Transcripts $(date -u +"%Y-%m-%d") for ${{ matrix.category }}" || echo "Nothing to commit"
+          git push || true
